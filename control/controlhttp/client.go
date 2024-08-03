@@ -497,11 +497,9 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr,
 	tr.DisableCompression = true
 
 	// (mis)use httptrace to extract the underlying net.Conn from the
-	// transport. We make exactly 1 request using this transport, so
-	// there will be exactly 1 GotConn call. Additionally, the
-	// transport handles 101 Switching Protocols correctly, such that
-	// the Conn will not be reused or kept alive by the transport once
-	// the response has been handed back from RoundTrip.
+	// transport. The transport handles 101 Switching Protocols correctly,
+	// such that the Conn will not be reused or kept alive by the transport
+	// once the response has been handed back from RoundTrip.
 	//
 	// In theory, the machinery of net/http should make it such that
 	// the trace callback happens-before we get the response, but
@@ -517,10 +515,16 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr,
 	// unexpected EOFs...), and we're bound to forget someday and
 	// introduce a protocol optimization at a higher level that starts
 	// eagerly transmitting from the server.
-	connCh := make(chan net.Conn, 1)
+	var lastConn atomic.Pointer[net.Conn]
 	trace := httptrace.ClientTrace{
+		// Even though we only make a single HTTP request which should
+		// require a single connection, the context (with the attached
+		// trace configuration) might be used by our custom dialer to
+		// make other HTTP requests (e.g. BootstrapDNS). We only care
+		// about the last connection made, which should be the one to
+		// the control server.
 		GotConn: func(info httptrace.GotConnInfo) {
-			connCh <- info.Conn
+			lastConn.Store(&info.Conn)
 		},
 	}
 	ctx = httptrace.WithClientTrace(ctx, &trace)
@@ -549,13 +553,11 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr,
 	// must direct I/O through resp.Body, but we can still use the
 	// underlying net.Conn for stuff like deadlines.
 	var switchedConn net.Conn
-	select {
-	case switchedConn = <-connCh:
-	default:
-	}
-	if switchedConn == nil {
+	if lc := lastConn.Load(); lc == nil || *lc == nil {
 		resp.Body.Close()
 		return nil, fmt.Errorf("httptrace didn't provide a connection")
+	} else {
+		switchedConn = *lc
 	}
 
 	if next := resp.Header.Get("Upgrade"); next != upgradeHeaderValue {
